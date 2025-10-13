@@ -1,7 +1,8 @@
 ﻿// ==============================================
-// CanMotorControl.cs (v3) 
-// ✅ SocketCAN + giữ nguyên logic CANopen
+// CanMotorControl.cs (v3.1)
+// ✅ SocketCAN + logic CANopen chuẩn DS402
 // ✅ Giới hạn hành trình + giám sát vị trí
+// ✅ Fault Reset, kiểm tra trạng thái, set mode sớm
 // ==============================================
 using System;
 using System.Diagnostics;
@@ -60,11 +61,12 @@ public class SocketCANInterface
     }
 
     public int Sock { get; private set; } = -1;
+
     private static string ExecuteCommand(string command)
     {
         try
         {
-            var process = new Process
+            var p = new Process
             {
                 StartInfo = new ProcessStartInfo
                 {
@@ -76,55 +78,36 @@ public class SocketCANInterface
                     CreateNoWindow = true
                 }
             };
-            process.Start();
-            string output = process.StandardOutput.ReadToEnd();
-            string error = process.StandardError.ReadToEnd();
-            process.WaitForExit();
-            if (!string.IsNullOrEmpty(error) && !error.Contains("RTNETLINK"))
-                return error;
-            return output;
+            p.Start();
+            string output = p.StandardOutput.ReadToEnd();
+            string error = p.StandardError.ReadToEnd();
+            p.WaitForExit();
+            return string.IsNullOrEmpty(error) || error.Contains("RTNETLINK") ? output : error;
         }
-        catch (Exception ex) { return $"Lỗi: {ex.Message}"; }
+        catch (Exception ex) { return ex.Message; }
     }
-    public bool Open(string interfaceName, int baudrate)
+
+    public bool Open(string ifname, int baudrate)
     {
         try
         {
-            // --- 1. Thiết lập giao diện CAN ---
-            Console.WriteLine($"🔧 Thiết lập CAN interface {interfaceName} với baudrate {baudrate}...");
+            Console.WriteLine($"🔧 Thiết lập CAN {ifname} @ {baudrate}bps...");
+            ExecuteCommand($"sudo ip link set {ifname} down");
+            ExecuteCommand($"sudo ip link set {ifname} type can bitrate {baudrate}");
+            ExecuteCommand($"sudo ip link set {ifname} up");
 
-            ExecuteCommand($"sudo ip link set {interfaceName} down");
-            ExecuteCommand($"sudo ip link set {interfaceName} type can bitrate {baudrate}");
-            ExecuteCommand($"sudo ip link set {interfaceName} up");
-
-            string status = ExecuteCommand($"ip -details link show {interfaceName}");
-            if (!status.Contains("UP") || !status.Contains("can"))
+            string s = ExecuteCommand($"ip -details link show {ifname}");
+            if (!s.Contains("UP") || !s.Contains("can"))
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"[LỖI] Không thể bật giao diện {interfaceName}!");
-                Console.ResetColor();
+                Console.WriteLine($"[❌] Không thể bật {ifname}");
                 return false;
             }
 
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[OK] Giao diện {interfaceName} đã sẵn sàng.");
-            Console.ResetColor();
-
-            // --- 2. Tạo socket raw CAN ---
             Sock = socket(AF_CAN, SOCK_RAW, CAN_RAW);
-            if (Sock < 0)
-            {
-                Console.Error.WriteLine("socket() failed");
-                return false;
-            }
+            if (Sock < 0) return false;
 
-            Ifreq ifr = new() { ifr_name = interfaceName };
-            if (ioctl(Sock, SIOCGIFINDEX, ref ifr) < 0)
-            {
-                Console.Error.WriteLine("ioctl() failed");
-                _ = close(Sock);
-                return false;
-            }
+            Ifreq ifr = new() { ifr_name = ifname };
+            if (ioctl(Sock, SIOCGIFINDEX, ref ifr) < 0) return false;
 
             Sockaddr_can addr = new()
             {
@@ -132,27 +115,17 @@ public class SocketCANInterface
                 can_ifindex = ifr.ifr_ifindex,
                 rest = new byte[8]
             };
-
             nint pAddr = Marshal.AllocHGlobal(Marshal.SizeOf(addr));
             Marshal.StructureToPtr(addr, pAddr, false);
-
-            if (bind(Sock, pAddr, (uint)Marshal.SizeOf(addr)) < 0)
-            {
-                Console.Error.WriteLine("bind() failed");
-                Marshal.FreeHGlobal(pAddr);
-                _ = close(Sock);
-                return false;
-            }
-
+            _ = bind(Sock, pAddr, (uint)Marshal.SizeOf(addr));
             Marshal.FreeHGlobal(pAddr);
-            Thread.Sleep(200);
+
+            Console.WriteLine($"[OK] {ifname} đã sẵn sàng.");
             return true;
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[ERROR] Lỗi khởi tạo CAN: {ex.Message}");
-            Console.ResetColor();
+            Console.WriteLine($"[ERROR] {ex.Message}");
             return false;
         }
     }
@@ -161,14 +134,12 @@ public class SocketCANInterface
 
     public void Send(Can_frame f)
     {
-        int size = Marshal.SizeOf(f);
-        nint p = Marshal.AllocHGlobal(size);
+        int sz = Marshal.SizeOf(f);
+        nint p = Marshal.AllocHGlobal(sz);
         Marshal.StructureToPtr(f, p, false);
-        int written = write(Sock, p, (nuint)size);
-        if (written != size)
-            Console.Error.WriteLine($"write() partial {written}/{size}");
+        _ = write(Sock, p, (nuint)sz);
         Marshal.FreeHGlobal(p);
-        Thread.Sleep(8);
+        Thread.Sleep(5);
     }
 
     public bool Read(out Can_frame frame, int timeout_ms)
@@ -177,7 +148,6 @@ public class SocketCANInterface
         Pollfd[] fds = new Pollfd[1];
         fds[0].fd = Sock;
         fds[0].events = POLLIN;
-
         int ret = poll(fds, 1, timeout_ms);
         if (ret > 0 && (fds[0].revents & POLLIN) != 0)
         {
@@ -185,42 +155,25 @@ public class SocketCANInterface
             nint p = Marshal.AllocHGlobal(size);
             int r = read(Sock, p, (nuint)size);
             if (r > 0)
-            {
-                object? obj = Marshal.PtrToStructure(p, typeof(Can_frame));
-                if (obj is Can_frame cf)
-                    frame = cf;
-                else
-                    frame = new Can_frame { data = new byte[8] };
-                Marshal.FreeHGlobal(p);
-                return true;
-            }
+                frame = (Can_frame)Marshal.PtrToStructure(p, typeof(Can_frame))!;
             Marshal.FreeHGlobal(p);
+            return true;
         }
         return false;
     }
 
     public void Flush()
     {
-        _ = new Can_frame() { data = new byte[8] };
         Pollfd[] fds = new Pollfd[1];
-        fds[0].fd = Sock;
-        fds[0].events = POLLIN;
-
-        while (true)
+        fds[0].fd = Sock; fds[0].events = POLLIN;
+        while (poll(fds, 1, 0) > 0)
         {
-            int ret = poll(fds, 1, 0); // timeout=0 => non-blocking
-            if (ret > 0 && (fds[0].revents & POLLIN) != 0)
-            {
-                int size = Marshal.SizeOf(typeof(Can_frame));
-                nint p = Marshal.AllocHGlobal(size);
-                int r = read(Sock, p, (nuint)size);
-                Marshal.FreeHGlobal(p);
-                if (r <= 0) break;
-            }
-            else break;
+            int sz = Marshal.SizeOf(typeof(Can_frame));
+            nint p = Marshal.AllocHGlobal(sz);
+            _ = read(Sock, p, (nuint)sz);
+            Marshal.FreeHGlobal(p);
         }
     }
-
 }
 
 class CanMotorControl
@@ -229,30 +182,28 @@ class CanMotorControl
     const uint SDO_SRV_BASE = 0x580;
     static readonly SocketCANInterface can = new();
 
-    static bool WaitForSdoResponse(byte nodeId, ushort index, byte sub, out SocketCANInterface.Can_frame resp, int timeout_ms)
+    // --- SDO helpers ---
+    static bool WaitSdoResp(byte nodeId, ushort index, byte sub, int timeout_ms)
     {
         int waited = 0;
-        const int step = 50;
         while (waited < timeout_ms)
         {
-            if (can.Read(out resp, step))
+            if (can.Read(out var f, 50))
             {
-                uint expected = SDO_SRV_BASE + nodeId;
-                if (resp.can_id == expected &&
-                    resp.data[1] == (byte)(index & 0xFF) &&
-                    resp.data[2] == (byte)(index >> 8 & 0xFF) &&
-                    resp.data[3] == sub)
+                if (f.can_id == SDO_SRV_BASE + nodeId &&
+                    f.data[1] == (byte)(index & 0xFF) &&
+                    f.data[2] == (byte)(index >> 8) &&
+                    f.data[3] == sub)
                     return true;
             }
-            waited += step;
+            waited += 50;
         }
-        resp = new SocketCANInterface.Can_frame { data = new byte[8] };
         return false;
     }
 
-    static bool SendSdoWriteWait(byte nodeId, ushort index, byte sub, uint data, byte len, int timeout_ms = 500)
+    static bool SdoWrite(byte nodeId, ushort index, byte sub, uint val, byte len, int timeout_ms = 500)
     {
-        can.Flush(); // 💡 Thêm dòng này
+        can.Flush();
         byte cs = len switch { 1 => 0x2F, 2 => 0x2B, _ => 0x23 };
         var f = new SocketCANInterface.Can_frame
         {
@@ -262,216 +213,162 @@ class CanMotorControl
         };
         f.data[0] = cs;
         f.data[1] = (byte)(index & 0xFF);
-        f.data[2] = (byte)(index >> 8 & 0xFF);
+        f.data[2] = (byte)(index >> 8);
         f.data[3] = sub;
-        for (int i = 0; i < len; i++) f.data[4 + i] = (byte)(data >> 8 * i & 0xFF);
+        for (int i = 0; i < len; i++) f.data[4 + i] = (byte)(val >> (8 * i));
         can.Send(f);
-
-        if (!WaitForSdoResponse(nodeId, index, sub, out _, timeout_ms))
+        if (!WaitSdoResp(nodeId, index, sub, timeout_ms))
         {
-            Console.Error.WriteLine($"SDO write timeout 0x{index:X4}");
+            Console.WriteLine($"⏱️ SDO timeout 0x{index:X4}");
             return false;
         }
         return true;
     }
 
-    static bool SendSdoRead(byte nodeId, ushort index, byte sub, byte[] outBuf, int timeout_ms = 500)
+    static bool SdoRead(byte nodeId, ushort index, byte sub, byte[] buf)
     {
-        can.Flush(); // 💡 Thêm dòng này
+        can.Flush();
         var f = new SocketCANInterface.Can_frame
         {
             can_id = SDO_CLI_BASE + nodeId,
             can_dlc = 8,
-            data = new byte[8]
+            data = new byte[8] { 0x40, (byte)(index & 0xFF), (byte)(index >> 8), sub, 0, 0, 0, 0 }
         };
-        f.data[0] = 0x40;
-        f.data[1] = (byte)(index & 0xFF);
-        f.data[2] = (byte)(index >> 8 & 0xFF);
-        f.data[3] = sub;
         can.Send(f);
-        if (!WaitForSdoResponse(nodeId, index, sub, out var resp, timeout_ms)) return false;
-        for (int i = 0; i < 4; i++) outBuf[i] = resp.data[4 + i];
+        if (!WaitSdoResp(nodeId, index, sub, 500)) return false;
+        can.Read(out var resp, 50);
+        for (int i = 0; i < 4; i++) buf[i] = resp.data[4 + i];
         return true;
     }
 
-    static int ReadActualPosition(byte nodeId)
+    static ushort ReadStatus(byte nodeId)
     {
-        byte[] buf = new byte[4];
-        if (!SendSdoRead(nodeId, 0x6063, 0x00, buf, 500)) return int.MinValue;
-        return BitConverter.ToInt32(buf, 0);
+        byte[] b = new byte[4];
+        if (!SdoRead(nodeId, 0x6041, 0x00, b)) return 0;
+        return (ushort)(b[0] | (b[1] << 8));
     }
 
-    static ushort ReadStatusword(byte nodeId)
+    static int ReadPos(byte nodeId)
     {
-        byte[] buf = new byte[4];
-        if (!SendSdoRead(nodeId, 0x6041, 0x00, buf, 400)) return 0;
-        return (ushort)(buf[0] | buf[1] << 8);
+        byte[] b = new byte[4];
+        if (!SdoRead(nodeId, 0x6063, 0x00, b)) return int.MinValue;
+        return BitConverter.ToInt32(b, 0);
     }
 
-    static bool WriteControlword(byte nodeId, ushort cw)
-        => SendSdoWriteWait(nodeId, 0x6040, 0x00, cw, 2, 500);
+    static void WriteCW(byte nodeId, ushort val) => SdoWrite(nodeId, 0x6040, 0x00, val, 2);
 
-    static void StopMotor(byte nodeId)
-    {
-        WriteControlword(nodeId, 0x000B); // disable voltage
-        Thread.Sleep(100);
-        WriteControlword(nodeId, 0x0000);
-        Console.ForegroundColor = ConsoleColor.Red;
-        Console.WriteLine("⚠️ Motor stopped due to position limit exceeded!");
-        Console.ResetColor();
-    }
-
+    // --- GoOperational chuẩn DS402 ---
     static void GoOperational(byte nodeId)
     {
-        var nmt = new SocketCANInterface.Can_frame
-        {
-            can_id = 0x000,
-            can_dlc = 2,
-            data = new byte[8]
-        };
-        nmt.data[0] = 0x01;
-        nmt.data[1] = nodeId;
+        var nmt = new SocketCANInterface.Can_frame { can_id = 0x000, can_dlc = 2, data = [0x01, nodeId, 0, 0, 0, 0, 0, 0] };
         can.Send(nmt);
         Thread.Sleep(200);
 
-        WriteControlword(nodeId, 0x0006);
-        Thread.Sleep(200);
-        WriteControlword(nodeId, 0x0007);
-        Thread.Sleep(200);
-        WriteControlword(nodeId, 0x000F);
-        Thread.Sleep(200);
+        SdoWrite(nodeId, 0x6060, 0x00, 1, 1); // chọn Profile Position sớm
+        Thread.Sleep(100);
 
-        ushort st = ReadStatusword(nodeId);
-        Console.WriteLine($"Status after op enable: 0x{st:X4}");
+        WriteCW(nodeId, 0x0080); // Reset Fault
+        Thread.Sleep(200);
+        WriteCW(nodeId, 0x0006); // Ready
+        Thread.Sleep(200);
+        WriteCW(nodeId, 0x0007); // Switched On
+        Thread.Sleep(200);
+        WriteCW(nodeId, 0x000F); // Operation Enabled
+        Thread.Sleep(300);
+
+        ushort st = ReadStatus(nodeId);
+        Console.WriteLine($"Status after enable: 0x{st:X4}");
     }
 
-    static bool SetProfileParamsAndTarget(byte nodeId, int targetPos, int velDEC, int accelDEC = 20000, int decelDEC = 20000)
+    static void StopMotor(byte nodeId)
     {
-        if (!SendSdoWriteWait(nodeId, 0x6083, 0x00, (uint)accelDEC, 4)) return false;
-        if (!SendSdoWriteWait(nodeId, 0x6084, 0x00, (uint)decelDEC, 4)) return false;
-        Thread.Sleep(2);
-        if (!SendSdoWriteWait(nodeId, 0x6081, 0x00, (uint)velDEC, 4)) return false;
-        Thread.Sleep(2);
-        if (!SendSdoWriteWait(nodeId, 0x607A, 0x00, (uint)targetPos, 4)) return false;
+        WriteCW(nodeId, 0x000B);
+        Thread.Sleep(100);
+        WriteCW(nodeId, 0x0000);
+        Console.WriteLine("\n⚠️ Motor stopped (limit exceeded).");
+    }
 
-        WriteControlword(nodeId, 0x000F);
-        Thread.Sleep(100);
-        WriteControlword(nodeId, 0x001F);
-        Thread.Sleep(100);
-        WriteControlword(nodeId, 0x003F);
-        Thread.Sleep(50);
-        WriteControlword(nodeId, 0x000F);
+    static bool MoveTo(byte nodeId, int target, int velDEC)
+    {
+        if (!SdoWrite(nodeId, 0x6081, 0x00, (uint)velDEC, 4)) return false;
+        if (!SdoWrite(nodeId, 0x607A, 0x00, (uint)target, 4)) return false;
+        WriteCW(nodeId, 0x001F); Thread.Sleep(50);
+        WriteCW(nodeId, 0x000F);
         return true;
     }
 
-    static bool WaitReachedPositionByPos(byte nodeId, int target, int posTol = 500, int stableCount = 5, int timeout_s = 30)
+    static bool WaitReached(byte nodeId, int target, int tol = 500, int timeout_s = 30)
     {
-        int initialPos = ReadActualPosition(nodeId);
-        if (initialPos == int.MinValue) return false;
-        int lastPos = initialPos;
-        bool startedMoving = false;
         int stable = 0;
-        int loops = timeout_s * 10;
-
-        for (int i = 0; i < loops; i++)
+        for (int i = 0; i < timeout_s * 10; i++)
         {
-            int pos = ReadActualPosition(nodeId);
-            if (pos == int.MinValue)
-            {
-                Thread.Sleep(100);
-                continue;
-            }
-
+            int pos = ReadPos(nodeId);
+            if (pos == int.MinValue) continue;
             int diff = Math.Abs(pos - target);
-            int delta = Math.Abs(pos - lastPos);
-            Console.Write($"\rpos={pos,8} diff={diff,6} Δ={delta,6}");
-
-            if (!startedMoving && Math.Abs(pos - initialPos) > 2000)
+            Console.Write($"\rpos={pos,8} diff={diff,6}");
+            if (diff <= tol)
             {
-                startedMoving = true;
-                Console.WriteLine($"\nMotor started moving (initialPos={initialPos})");
+                if (++stable > 5) { Console.WriteLine("\n✅ Reached."); return true; }
             }
-
-            if (startedMoving)
-            {
-                if (diff <= posTol)
-                {
-                    stable++;
-                    if (stable >= stableCount)
-                    {
-                        Console.WriteLine("\n✅ Reached target position.");
-                        return true;
-                    }
-                }
-                else
-                {
-                    stable = 0;
-                }
-            }
-
-            lastPos = pos;
+            else stable = 0;
             Thread.Sleep(100);
         }
-
-        Console.WriteLine("\n⚠️ Timeout waiting for position reached!");
+        Console.WriteLine("\n⚠️ Timeout waiting for position.");
         return false;
     }
 
-    // ========================= MAIN =========================
-    static void Main(string[] args)
+    static void Main()
     {
-        ArgumentNullException.ThrowIfNull(args);
         string ifname = "can0";
-        byte nodeId = 1;
-        int posA = 0, posB = 3_700_000;
-        int velDEC = 5_000_000;
+        byte nodeId = 2;
+        int posA = 0, posB = 3_700_000, vel = 5_000_000;
 
-        if (!can.Open(ifname, 50000))
-        {
-            Console.Error.WriteLine($"Cannot open {ifname}. Run as root!");
-            return;
-        }
-
+        if (!can.Open(ifname, 50000)) return;
         Console.WriteLine($"Connected to {ifname}");
-        GoOperational(nodeId);
-        SendSdoWriteWait(nodeId, 0x6060, 0x00, 1, 1, 500);
-        Thread.Sleep(100);
 
-        Console.WriteLine("⬆️  UP: Move to TOP\n⬇️  DOWN: Move to BOTTOM\nESC: Exit");
+        GoOperational(nodeId);
+
+        Console.WriteLine("⬆️  UP: TOP\n⬇️  DOWN: BOTTOM\nESC: Exit");
 
         bool run = true;
         while (run)
         {
-            int pos = ReadActualPosition(nodeId);
+            int pos = ReadPos(nodeId);
             if (pos != int.MinValue)
             {
-                Console.Write($"\rCurrent Position: {pos,8} ");
+                Console.Write($"\rCurrent: {pos,8}");
                 if (pos < posA - 5000 || pos > posB + 5000)
                 {
                     StopMotor(nodeId);
-                    run = false;
                     break;
                 }
             }
 
             if (Console.KeyAvailable)
             {
-                var key = Console.ReadKey(true).Key;
-                if (key == ConsoleKey.Escape) break;
-                else if (key == ConsoleKey.UpArrow)
+                var k = Console.ReadKey(true).Key;
+                if (k == ConsoleKey.Escape) break;
+                if (k == ConsoleKey.UpArrow)
                 {
-                    Console.WriteLine($"\n>>> Moving to TOP ({posB})");
-                    if (SetProfileParamsAndTarget(nodeId, posB, velDEC))
-                        Console.WriteLine("Moving UP...");
+                    if (pos > posB - 10000)
+                    {
+                        Console.WriteLine("\n⚠️ Near top limit!");
+                        continue;
+                    }
+                    Console.WriteLine($"\n>>> Move to TOP ({posB})");
+                    if (MoveTo(nodeId, posB, vel)) WaitReached(nodeId, posB);
                 }
-                else if (key == ConsoleKey.DownArrow)
+                else if (k == ConsoleKey.DownArrow)
                 {
-                    Console.WriteLine($"\n<<< Moving to BOTTOM ({posA})");
-                    if (SetProfileParamsAndTarget(nodeId, posA, velDEC))
-                        Console.WriteLine("Moving DOWN...");
+                    if (pos < posA + 10000)
+                    {
+                        Console.WriteLine("\n⚠️ Near bottom limit!");
+                        continue;
+                    }
+                    Console.WriteLine($"\n<<< Move to BOTTOM ({posA})");
+                    if (MoveTo(nodeId, posA, vel)) WaitReached(nodeId, posA);
                 }
             }
-
             Thread.Sleep(100);
         }
 
