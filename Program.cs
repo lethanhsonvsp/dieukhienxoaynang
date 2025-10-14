@@ -1,129 +1,69 @@
-﻿using dieukhienxoaynang;
+﻿using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics.Arm;
 using System.Text;
-using System.Xml.Linq;
+using System.Threading;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
-namespace dieukhienxoaynang
+public class ControlSpeed
 {
-    public class ControlSpeed
+    public static int _speed = 0;
+    public static bool _running = true;
+
+    // Luồng chạy nền để đọc phím
+    public static void Start()
     {
-        public static int _speedRotate = 0;
-        public static int _speedLift = 0;
-        public static bool _running = true;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct Termios
-        {
-            public uint c_iflag;
-            public uint c_oflag;
-            public uint c_cflag;
-            public uint c_lflag;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
-            public byte[] c_cc;
-            public uint c_ispeed;
-            public uint c_ospeed;
-        }
-
-        [DllImport("libc")]
-        private static extern int tcgetattr(int fd, out Termios termios_p);
-
-        [DllImport("libc")]
-        private static extern int tcsetattr(int fd, int optional_actions, ref Termios termios_p);
-
-        [DllImport("libc")]
-        private static extern int read(int fd, byte[] buf, int count);
-
-        private const int STDIN_FILENO = 0;
-        private const int TCSANOW = 0;
-        private static Termios originalTermios;
-
-        public static void Start()
-        {
-            SetRawMode(true);
-            Thread inputThread = new(ReadKeys)
-            {
-                IsBackground = true
-            };
-            inputThread.Start();
-        }
-
-        private static void SetRawMode(bool enable)
-        {
-            tcgetattr(STDIN_FILENO, out originalTermios);
-            Termios raw = originalTermios;
-            if (enable)
-            {
-                raw.c_lflag &= ~(1u | 2u | 4u | 8u | 256u); // Tắt canonical + echo + signal
-            }
-            else
-            {
-                raw = originalTermios;
-            }
-            tcsetattr(STDIN_FILENO, TCSANOW, ref raw);
-        }
-
-        public static void ReadKeys()
-        {
-            Console.WriteLine("Điều khiển:");
-            Console.WriteLine("← → : Xoay trái / phải (node1)");
-            Console.WriteLine("↑ ↓ : Nâng / hạ (node2)");
-            Console.WriteLine("Giữ phím để chạy, nhả để dừng.");
-            Console.WriteLine("C : Thoát chương trình\n");
-
-            byte[] buf = new byte[3];
-
-            while (_running)
-            {
-                int n = read(STDIN_FILENO, buf, 3);
-                if (n > 0)
-                {
-                    if (n == 3 && buf[0] == 0x1B && buf[1] == 0x5B)
-                    {
-                        switch (buf[2])
-                        {
-                            case 0x41: _speedLift = 10; break;  // ↑
-                            case 0x42: _speedLift = -10; break; // ↓
-                            case 0x43: _speedRotate = 10; break; // →
-                            case 0x44: _speedRotate = -10; break; // ←
-                        }
-                    }
-                    else if (n == 1)
-                    {
-                        if (buf[0] == 'c' || buf[0] == 'C')
-                        {
-                            _running = false;
-                            _speedLift = 0;
-                            _speedRotate = 0;
-                            Console.WriteLine("\nThoát chương trình.");
-                            break;
-                        }
-                    }
-                }
-                else
-                {
-                    // Không có phím nào đang nhấn -> dừng
-                    _speedRotate = 0;
-                    _speedLift = 0;
-                }
-
-                Thread.Sleep(50); // Giảm tải CPU
-            }
-
-            SetRawMode(false);
-        }
-
-        public static (int rotate, int lift) GetSpeeds()
-        {
-            return (_speedRotate, _speedLift);
-        }
+        Thread inputThread = new Thread(ReadKeys);
+        inputThread.IsBackground = true;
+        inputThread.Start();
     }
 
+    // Hàm lấy giá trị tốc độ hiện tại
+    public static int GetSpeed()
+    {
+        return _speed;
+    }
+
+    public static void ReadKeys()
+    {
+        while (_running)
+        {
+            if (Console.KeyAvailable)
+            {
+                var key = Console.ReadKey(true).Key;
+
+                if (key == ConsoleKey.UpArrow)
+                {
+                    _speed = 10; // gán mặc định 100 nếu đang 0
+                }
+                else if (key == ConsoleKey.DownArrow)
+                {
+                    _speed = -10;
+                }
+                else if (key == ConsoleKey.S)
+                {
+                    _speed = 0;
+                }
+                else if (key == ConsoleKey.C)
+                {
+                    _speed = 0;
+                    _running = false;
+                    Console.WriteLine("Thoát keyboard listener.");
+                }
+            }
+
+            Thread.Sleep(100); // tránh CPU 100%
+        }
+    }
+}
+using System;
+using System.Runtime.InteropServices;
+
+namespace HelloWorld
+{
     public class ControlPDO
     {
         static int preProfileVelocity;
-        static readonly int gear_ratio = 350; // tỉ số truyền cơ khí
 
         [StructLayout(LayoutKind.Sequential, Pack = 1)]
         public struct CanFrame
@@ -141,15 +81,13 @@ namespace dieukhienxoaynang
         [DllImport("libc", SetLastError = true)]
         public static extern int read(int fd, ref CanFrame frame, int len);
 
-        static readonly int encoder_Resolution = 10000;
+        static int encoder_Resolution = 10000;
         // Hàm gửi frame
         public static void SendFrame(int __sock, uint canId, byte[] payload)
         {
-            CanFrame frame = new()
-            {
-                can_id = canId,
-                can_dlc = (byte)payload.Length
-            };
+            CanFrame frame = new CanFrame();
+            frame.can_id = canId;
+            frame.can_dlc = (byte)payload.Length;
             frame.__pad1 = frame.__pad2 = frame.__pad3 = 0;
             frame.data = new byte[8];
             Array.Copy(payload, frame.data, payload.Length);
@@ -164,17 +102,15 @@ namespace dieukhienxoaynang
         public static void WriteSDO_U32(int sock, uint nodeId, ushort index, byte subIndex, uint value)
         {
             uint sdoTxId = 0x600 + nodeId;
-            byte[] data =
-            [
-                0x23, // Write 4 bytes
-                (byte)(index & 0xFF),
-                (byte)(index >> 8),
-                subIndex,
-                (byte)(value & 0xFF),
-                (byte)((value >> 8) & 0xFF),
-                (byte)((value >> 16) & 0xFF),
-                (byte)((value >> 24) & 0xFF),
-            ];
+            byte[] data = new byte[8];
+            data[0] = 0x23; // Write 4 bytes
+            data[1] = (byte)(index & 0xFF);
+            data[2] = (byte)(index >> 8);
+            data[3] = subIndex;
+            data[4] = (byte)(value & 0xFF);
+            data[5] = (byte)((value >> 8) & 0xFF);
+            data[6] = (byte)((value >> 16) & 0xFF);
+            data[7] = (byte)((value >> 24) & 0xFF);
             SendFrame(sock, sdoTxId, data);
             Thread.Sleep(10);
         }
@@ -280,10 +216,10 @@ namespace dieukhienxoaynang
         {
             uint sdoTxId = 0x600 + nodeId;
             uint sdoRxId = 0x580 + nodeId;
-            byte[] req = [0x40, 0x41, 0x60, 0x00, 0, 0, 0, 0];
+            byte[] req = new byte[8] { 0x40, 0x41, 0x60, 0x00, 0, 0, 0, 0 };
             SendFrame(__sock, sdoTxId, req);
 
-            CanFrame rxFrame = new();
+            CanFrame rxFrame = new CanFrame();
             int n = read(__sock, ref rxFrame, Marshal.SizeOf(typeof(CanFrame)));
             if (n > 0 && rxFrame.can_id == sdoRxId)
             {
@@ -360,7 +296,7 @@ namespace dieukhienxoaynang
         {
             while (ControlSpeed._running)
             {
-                CanFrame rx = new();
+                CanFrame rx = new CanFrame();
                 int nbytes = read(__sock, ref rx, Marshal.SizeOf(typeof(CanFrame)));
                 if (nbytes > 0)
                 {
@@ -377,7 +313,7 @@ namespace dieukhienxoaynang
                     if (rx.can_id == 0x380 + nodeId) // TPDO3
                     {
                         long _vel = BitConverter.ToInt32(rx.data, 0);
-                        long vel = (_vel * 1875) / (512 * encoder_Resolution * gear_ratio);
+                        long vel = (_vel * 1875) / (512 * encoder_Resolution * 350);
                         Console.WriteLine($"[RPDO3] Velocity actual = {vel}");
                     }
                     if (rx.can_id == 0x480 + nodeId)
@@ -395,48 +331,199 @@ namespace dieukhienxoaynang
         public static void EnableMotorVelocityMode(int ___sock, uint _nodeId)
         {
             uint sdoTxId = 0x600 + (uint)_nodeId;
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2F, 0x60, 0x60, 0x00, 0x03, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2F, 0x60, 0x60, 0x00, 0x03, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00 });
             Thread.Sleep(100);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00]);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00 });
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00 });
         }
 
         public static void EnableMotorPositionMode(int ___sock, uint _nodeId)
         {
             uint sdoTxId = 0x600 + (uint)_nodeId;
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2F, 0x60, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2F, 0x60, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00 });
             Thread.Sleep(100);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00]);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00 });
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00 });
         }
 
         public static void EnableMotorHomeMode(int ___sock, uint _nodeId)
         {
             uint sdoTxId = 0x600 + (uint)_nodeId;
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2F, 0x60, 0x60, 0x00, 0x04, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2F, 0x60, 0x60, 0x00, 0x04, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00 });
             Thread.Sleep(100);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00 });
             Thread.Sleep(50);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00]);
-            ControlPDO.SendFrame(___sock, sdoTxId, [0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00 });
+            ControlPDO.SendFrame(___sock, sdoTxId, new byte[] { 0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00 });
+        }
+        public static void SetPositionLimit(int sock, uint nodeId, int posMin, int posMax)
+        {
+            Console.WriteLine($"⚙️  Đặt giới hạn vị trí cho node {nodeId}: Min={posMin}, Max={posMax}");
+
+            // CiA-402 Object 0x607D
+            WriteSDO_U32(sock, nodeId, 0x607D, 0x01, (uint)posMax); // Max Position
+            Thread.Sleep(20);
+            WriteSDO_U32(sock, nodeId, 0x607D, 0x02, (uint)posMin); // Min Position
+            Thread.Sleep(20);
         }
     }
+}using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace HelloWorld
+{
+    public class ControlSDO
+    {
+        const int AF_CAN = 29;
+        const int SOCK_RAW = 3;
+        const int CAN_RAW = 1;
+        const uint SIOCGIFINDEX = 0x8933;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct IfReq
+        {
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+            public byte[] ifr_name;
+            public int ifr_ifindex;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SockAddrCan
+        {
+            public ushort can_family;
+            public int can_ifindex;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+            public byte[] _pad;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        struct CanFrame
+        {
+            public uint can_id;
+            public byte can_dlc;
+            public byte __pad1, __pad2, __pad3;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+            public byte[] data;
+        }
+
+        [DllImport("libc", SetLastError = true)]
+        static extern int socket(int domain, int type, int protocol);
+        [DllImport("libc", SetLastError = true)]
+        static extern int ioctl(int fd, uint request, ref IfReq ifr);
+        [DllImport("libc", SetLastError = true)]
+        static extern int bind(int fd, ref SockAddrCan addr, int addrlen);
+        [DllImport("libc", SetLastError = true)]
+        static extern int write(int fd, ref CanFrame frame, int len);
+        [DllImport("libc", SetLastError = true)]
+        static extern int read(int fd, ref CanFrame frame, int len);
+
+        public static int OpenSocket(string ifname)
+        {
+            int sock = socket(AF_CAN, SOCK_RAW, CAN_RAW);
+            if (sock < 0) throw new Exception("Cannot open socket!");
+
+            IfReq ifr = new IfReq();
+            ifr.ifr_name = Encoding.ASCII.GetBytes(ifname.PadRight(16, '\0'));
+            ifr.ifr_ifindex = 0;
+            if (ioctl(sock, SIOCGIFINDEX, ref ifr) < 0)
+                throw new Exception("Cannot get ifindex!");
+
+            SockAddrCan addr = new SockAddrCan();
+            addr.can_family = AF_CAN;
+            addr.can_ifindex = ifr.ifr_ifindex;
+            addr._pad = new byte[8];
+            if (bind(sock, ref addr, Marshal.SizeOf(typeof(SockAddrCan))) < 0)
+                throw new Exception("Cannot bind socket!");
+
+            return sock;
+        }
+
+        public static void SendFrame(int sock, uint canId, byte[] payload)
+        {
+            CanFrame frame = new CanFrame();
+            frame.can_id = canId;
+            frame.can_dlc = (byte)payload.Length;
+            frame.__pad1 = frame.__pad2 = frame.__pad3 = 0;
+            frame.data = new byte[8];
+            Array.Copy(payload, frame.data, payload.Length);
+            int nbytes = write(sock, ref frame, Marshal.SizeOf(typeof(CanFrame)));
+            if (nbytes < 0)
+                Console.WriteLine("Error sending CAN frame!");
+        }
+
+        public static ushort ReadStatusword(int sock, uint nodeId)
+        {
+            uint sdoTxId = 0x600 + nodeId;
+            uint sdoRxId = 0x580 + nodeId;
+            byte[] req = new byte[8] { 0x40, 0x41, 0x60, 0x00, 0, 0, 0, 0 };
+            SendFrame(sock, sdoTxId, req);
+
+            CanFrame rxFrame = new CanFrame();
+            int n = read(sock, ref rxFrame, Marshal.SizeOf(typeof(CanFrame)));
+            if (n > 0 && rxFrame.can_id == sdoRxId)
+            {
+                return BitConverter.ToUInt16(rxFrame.data, 4);
+            }
+            return 0;
+        }
+
+        public static void EnsureMotorEnabled(int sock, uint nodeId)
+        {
+            uint sdoTxId = 0x600 + nodeId;
+            ushort status = ReadStatusword(sock, nodeId);
+            if ((status & 0x04) != 0) return;
+
+            SendFrame(sock, sdoTxId, new byte[] { 0x2F, 0x60, 0x60, 0x00, 0x03, 0x00, 0x00, 0x00 });
+            Thread.Sleep(20);
+            SendFrame(sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00 });
+            Thread.Sleep(20);
+            SendFrame(sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00 });
+            Thread.Sleep(20);
+            SendFrame(sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00 });
+            Thread.Sleep(50);
+        }
+
+        public static void SetVelocitySafe(int sock, uint nodeId, int velocity)
+        {
+            uint sdoTxId = 0x600 + nodeId;
+            byte[] velReset = BitConverter.GetBytes(0);
+            SendFrame(sock, sdoTxId, new byte[] { 0x23, 0xFF, 0x60, 0x00, velReset[0], velReset[1], velReset[2], velReset[3] });
+            SendFrame(sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00 });
+            Thread.Sleep(20);
+
+            byte[] velBytes = BitConverter.GetBytes(velocity);
+            SendFrame(sock, sdoTxId, new byte[] { 0x23, 0xFF, 0x60, 0x00, velBytes[0], velBytes[1], velBytes[2], velBytes[3] });
+            SendFrame(sock, sdoTxId, new byte[] { 0x2B, 0x40, 0x60, 0x00, 0x1F, 0x00, 0x00, 0x00 });
+
+            Console.WriteLine($"SetVelocitySafe: {velocity}");
+        }
+    }
+}using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.Threading;
+
+namespace HelloWorld
+{
     class Program
     {
         const int AF_CAN = 29;
@@ -471,14 +558,20 @@ namespace dieukhienxoaynang
         static extern int bind(int fd, ref SockAddrCan addr, int addrlen);
 
         static int sock;
-        static readonly uint nodeId = 1;
-        static readonly uint nodeId2 = 2;
-        static readonly int gear_ratio_rotate_motor = 350;
-        static readonly int convert_lift_param = 33; //lift module: 1mm/s = 33 rpm
+        static uint node1 = 1; // Motor xoay
+        static uint node2 = 2; // Motor nâng
+        static int gear_ratio_rotate_motor = 350;
+        static double convert_lift_param = 33;
         static bool registerShutdowAction = true;
+        static bool isRotateMode = true; // true = xoay, false = nâng
 
         static void Main(string[] args)
         {
+            Console.Clear();
+            Console.WriteLine("==== CANopen Dual Motor Controller ====\n");
+
+            // Menu chọn chế độ chạy
+            ShowMenu();
 
             // Thiết lập CAN
             Console.Write("\nNhập tên interface CAN (mặc định can0): ");
@@ -495,26 +588,26 @@ namespace dieukhienxoaynang
                 return;
             }
 
-            ControlPDO.SendFrame(sock, 0x000, [0x01, (byte)nodeId]);
-            ControlPDO.SendFrame(sock, 0x000, [0x01, (byte)nodeId2]);
-            Console.WriteLine("Sent NMT Start to node " + nodeId);
+            // Gửi NMT Start tới hai node
+            ControlPDO.SendFrame(sock, 0x000, new byte[] { 0x01, (byte)node1 });
+            ControlPDO.SendFrame(sock, 0x000, new byte[] { 0x01, (byte)node2 });
+            Console.WriteLine($"✅ Sent NMT Start to nodes {node1} & {node2}");
 
-            ControlPDO.ConfigurePDO_Default(sock, nodeId);
-            ControlPDO.ConfigurePDO_Default(sock, nodeId2);
+            // Cấu hình
+            ControlPDO.ConfigurePDO_Default(sock, node1);
+            ControlPDO.ConfigurePDO_Default(sock, node2);
+            ControlPDO.EnableMotorVelocityMode(sock, node1);
+            ControlPDO.EnableMotorVelocityMode(sock, node2);
 
-            ControlPDO.EnableMotorVelocityMode(sock, nodeId);
-            ControlPDO.EnableMotorVelocityMode(sock, nodeId2);
-
-            // ControlPDO.EnableMotorPositionMode(sock, nodeId);
-            // ControlPDO.EnableMotorPositionMode(sock, nodeId2);
-
+            // Bắt đầu điều khiển
             ControlSpeed.Start();
 
             if (ControlSpeed._running)
             {
-                Thread tpdoThread = new(() => ControlPDO.ListenTPDO(sock, (uint)nodeId));
+                Thread tpdoThread = new Thread(() => ControlPDO.ListenTPDO(sock, node1));
                 tpdoThread.Start();
             }
+
             while (ControlSpeed._running)
             {
                 if (registerShutdowAction)
@@ -524,21 +617,54 @@ namespace dieukhienxoaynang
                     registerShutdowAction = false;
                 }
 
-                var (speed_rotation, speed_lift) = ControlSpeed.GetSpeeds();
+                int speed_rotation = ControlSpeed.GetSpeed() * gear_ratio_rotate_motor;
+                int speed_lift = Convert.ToInt32(ControlSpeed.GetSpeed() * convert_lift_param);
 
-                // Quy đổi sang tốc độ cơ học
-                int speed_rotation_rpm = speed_rotation * gear_ratio_rotate_motor;
-                int speed_lift_rpm = speed_lift * convert_lift_param;
+                // Chỉ chạy motor theo lựa chọn menu
+                if (isRotateMode)
+                {
+                    // Chạy motor xoay (Node 1)
+                    ControlPDO.SendVelocity(sock, node1, speed_rotation);
+                    ControlPDO.SendVelocity(sock, node2, 0);
+                }
+                else
+                {
+                    // Chạy motor nâng (Node 2)
+                    ControlPDO.SendVelocity(sock, node1, 0);
+                    ControlPDO.SendVelocity(sock, node2, speed_lift);
+                }
 
-                // Node1: xoay, Node2: nâng hạ
-                ControlPDO.SendVelocity(sock, nodeId, speed_rotation_rpm);
-                ControlPDO.SendVelocity(sock, nodeId2, speed_lift_rpm);
-
-                Thread.Sleep(200);
+                Thread.Sleep(1000);
             }
-
-
         }
+
+        static void ShowMenu()
+        {
+            Console.WriteLine("=======================================");
+            Console.WriteLine(" CHỌN CHẾ ĐỘ HOẠT ĐỘNG:");
+            Console.WriteLine(" 1. Xoay (Node 1)");
+            Console.WriteLine(" 2. Nâng (Node 2)");
+            Console.WriteLine("=======================================");
+            Console.Write("Nhập lựa chọn (1 hoặc 2): ");
+            string? choice = Console.ReadLine();
+
+            if (choice == "1")
+            {
+                isRotateMode = true;
+                Console.WriteLine("→ Đã chọn: XOAY (Node 1 hoạt động)");
+            }
+            else if (choice == "2")
+            {
+                isRotateMode = false;
+                Console.WriteLine("→ Đã chọn: NÂNG (Node 2 hoạt động)");
+            }
+            else
+            {
+                Console.WriteLine("⚠️ Lựa chọn không hợp lệ, mặc định là XOAY.");
+                isRotateMode = true;
+            }
+        }
+
         static string ExecuteCommand(string command)
         {
             try
@@ -570,6 +696,7 @@ namespace dieukhienxoaynang
                 return $"Lỗi khi chạy lệnh: {ex.Message}";
             }
         }
+
         static bool StartCanOpen(string interfaceName, int baudrate)
         {
             Console.WriteLine($"Thiết lập CAN {interfaceName} với baudrate {baudrate}");
@@ -590,11 +717,9 @@ namespace dieukhienxoaynang
                 return false;
             }
 
-            IfReq ifr = new()
-            {
-                ifr_name = Encoding.ASCII.GetBytes($"{interfaceName}\0".PadRight(16, '\0')),
-                ifr_ifindex = 0
-            };
+            IfReq ifr = new IfReq();
+            ifr.ifr_name = Encoding.ASCII.GetBytes($"{interfaceName}\0".PadRight(16, '\0'));
+            ifr.ifr_ifindex = 0;
 
             if (ioctl(sock, SIOCGIFINDEX, ref ifr) < 0)
             {
@@ -602,12 +727,10 @@ namespace dieukhienxoaynang
                 return false;
             }
 
-            SockAddrCan addr = new()
-            {
-                can_family = AF_CAN,
-                can_ifindex = ifr.ifr_ifindex,
-                _pad = new byte[8]
-            };
+            SockAddrCan addr = new SockAddrCan();
+            addr.can_family = AF_CAN;
+            addr.can_ifindex = ifr.ifr_ifindex;
+            addr._pad = new byte[8];
 
             if (bind(sock, ref addr, Marshal.SizeOf(typeof(SockAddrCan))) < 0)
             {
@@ -621,20 +744,20 @@ namespace dieukhienxoaynang
 
         static void OnExit(object? sender, ConsoleCancelEventArgs args)
         {
-            Console.WriteLine("Nhận Ctrl+C, gửi Velocity = 0...");
+            Console.WriteLine("\nNhận Ctrl+C, gửi Velocity = 0...");
             ControlSpeed._running = false;
-            ControlPDO.SendVelocity(sock, nodeId, 0);
-            Thread.Sleep(200); // đảm bảo gửi đi
+            ControlPDO.SendVelocity(sock, node1, 0);
+            ControlPDO.SendVelocity(sock, node2, 0);
+            Thread.Sleep(200);
         }
 
         static void OnProcessExit(object? sender, EventArgs e)
         {
             Console.WriteLine("ProcessExit, gửi Velocity = 0...");
             ControlSpeed._running = false;
-            ControlPDO.SendVelocity(sock, nodeId, 0);
+            ControlPDO.SendVelocity(sock, node1, 0);
+            ControlPDO.SendVelocity(sock, node2, 0);
             Thread.Sleep(200);
         }
     }
-
 }
-
