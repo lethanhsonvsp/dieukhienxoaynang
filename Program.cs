@@ -528,7 +528,7 @@ namespace dieukhienxoaynang
 
                 // Quy đổi sang tốc độ cơ học
                 int speed_rotation_rpm = speed_rotation * gear_ratio_rotate_motor;
-                int speed_lift_rpm = Convert.ToInt32(speed_lift * convert_lift_param);
+                int speed_lift_rpm = speed_lift * convert_lift_param;
 
                 // Node1: xoay, Node2: nâng hạ
                 ControlPDO.SendVelocity(sock, nodeId, speed_rotation_rpm);
