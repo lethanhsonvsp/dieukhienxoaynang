@@ -1,380 +1,514 @@
 ﻿using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace dieukhienxoaynang;
-
-public class SocketCANInterface
+public class ControlSpeed
 {
-    const int AF_CAN = 29, SOCK_RAW = 3, CAN_RAW = 1;
-    const uint SIOCGIFINDEX = 0x8933;
-    const int IFNAMSIZ = 16;
-    const short POLLIN = 0x0001;
+    public static int _speed = 0;
+    public static bool _running = true;
 
-    [DllImport("libc")] static extern int socket(int domain, int type, int protocol);
-    [DllImport("libc")] static extern int ioctl(int fd, uint request, ref Ifreq ifr);
-    [DllImport("libc")] static extern int bind(int sockfd, nint addr, uint addrlen);
-    [DllImport("libc")] static extern int write(int fd, nint buf, nuint count);
-    [DllImport("libc")] static extern int read(int fd, nint buf, nuint count);
-    [DllImport("libc")] static extern int close(int fd);
-    [DllImport("libc")] static extern int poll([In, Out] Pollfd[] fds, uint nfds, int timeout);
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
-    struct Ifreq { [MarshalAs(UnmanagedType.ByValTStr, SizeConst = IFNAMSIZ)] public string ifr_name; public int ifr_ifindex; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct Sockaddr_can
+    // Luồng chạy nền để đọc phím
+    public static void Start()
     {
-        public ushort can_family;
-        public int can_ifindex;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)] public byte[] rest;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct Can_frame
-    {
-        public uint can_id;
-        public byte can_dlc;
-        public byte __pad, __res0, __res1;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)] public byte[] data;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct Pollfd { public int fd; public short events; public short revents; }
-
-    public int Sock { get; private set; } = -1;
-
-    private static string ExecuteCommand(string command)
-    {
-        try
+        Thread inputThread = new(ReadKeys)
         {
-            var p = new Process
+            IsBackground = true
+        };
+        inputThread.Start();
+    }
+
+    // Hàm lấy giá trị tốc độ hiện tại
+    public static int GetSpeed()
+    {
+        return _speed;
+    }
+
+    public static void ReadKeys()
+    {
+        while (_running)
+        {
+            if (Console.KeyAvailable)
             {
-                StartInfo = new ProcessStartInfo
+                var key = Console.ReadKey(true).Key;
+
+                if (key == ConsoleKey.UpArrow)
                 {
-                    FileName = "/bin/bash",
-                    Arguments = $"-c \"{command}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
+                    _speed = 10; // gán mặc định 100 nếu đang 0
                 }
-            };
-            p.Start();
-            string output = p.StandardOutput.ReadToEnd();
-            string error = p.StandardError.ReadToEnd();
-            p.WaitForExit();
-            return string.IsNullOrEmpty(error) || error.Contains("RTNETLINK") ? output : error;
-        }
-        catch (Exception ex) { return ex.Message; }
-    }
-
-    public bool Open(string ifname, int baudrate)
-    {
-        try
-        {
-            Console.WriteLine($"🔧 Thiết lập CAN {ifname} @ {baudrate}bps...");
-            ExecuteCommand($"sudo ip link set {ifname} down");
-            ExecuteCommand($"sudo ip link set {ifname} type can bitrate {baudrate}");
-            ExecuteCommand($"sudo ip link set {ifname} up");
-
-            string s = ExecuteCommand($"ip -details link show {ifname}");
-            if (!s.Contains("UP") || !s.Contains("can"))
-            {
-                Console.WriteLine($"[❌] Không thể bật {ifname}");
-                return false;
+                else if (key == ConsoleKey.DownArrow)
+                {
+                    _speed = -10;
+                }
+                else if (key == ConsoleKey.S)
+                {
+                    _speed = 0;
+                }
+                else if (key == ConsoleKey.C)
+                {
+                    _speed = 0;
+                    _running = false;
+                    Console.WriteLine("Thoát keyboard listener.");
+                }
             }
 
-            Sock = socket(AF_CAN, SOCK_RAW, CAN_RAW);
-            Ifreq ifr = new() { ifr_name = ifname };
-            _ = ioctl(Sock, SIOCGIFINDEX, ref ifr);
-
-            Sockaddr_can addr = new() { can_family = AF_CAN, can_ifindex = ifr.ifr_ifindex, rest = new byte[8] };
-            nint pAddr = Marshal.AllocHGlobal(Marshal.SizeOf(addr));
-            Marshal.StructureToPtr(addr, pAddr, false);
-            _ = bind(Sock, pAddr, (uint)Marshal.SizeOf(addr));
-            Marshal.FreeHGlobal(pAddr);
-
-            Console.WriteLine($"[OK] {ifname} đã sẵn sàng.");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[ERROR] {ex.Message}");
-            return false;
-        }
-    }
-
-    public void Close() { if (Sock >= 0) _ = close(Sock); }
-
-    public void Send(Can_frame f)
-    {
-        int sz = Marshal.SizeOf(f);
-        nint p = Marshal.AllocHGlobal(sz);
-        Marshal.StructureToPtr(f, p, false);
-        _ = write(Sock, p, (nuint)sz);
-        Marshal.FreeHGlobal(p);
-        Thread.Sleep(5);
-    }
-
-    public bool Read(out Can_frame frame, int timeout_ms)
-    {
-        frame = new Can_frame { data = new byte[8] };
-        Pollfd[] fds = [new() { fd = Sock, events = POLLIN }];
-        int ret = poll(fds, 1, timeout_ms);
-        if (ret > 0 && (fds[0].revents & POLLIN) != 0)
-        {
-            int size = Marshal.SizeOf(typeof(Can_frame));
-            nint p = Marshal.AllocHGlobal(size);
-            int r = read(Sock, p, (nuint)size);
-            if (r > 0)
-                frame = (Can_frame)Marshal.PtrToStructure(p, typeof(Can_frame))!;
-            Marshal.FreeHGlobal(p);
-            return true;
-        }
-        return false;
-    }
-
-    public void Flush()
-    {
-        Pollfd[] fds = [new() { fd = Sock, events = POLLIN }];
-        while (poll(fds, 1, 0) > 0)
-        {
-            int sz = Marshal.SizeOf(typeof(Can_frame));
-            nint p = Marshal.AllocHGlobal(sz);
-            _ = read(Sock, p, (nuint)sz);
-            Marshal.FreeHGlobal(p);
+            Thread.Sleep(100); // tránh CPU 100%
         }
     }
 }
 
-class CanMotorControl
+
+public class ControlPDO
 {
-    const uint SDO_CLI_BASE = 0x600; // client → server
-    const uint SDO_SRV_BASE = 0x580; // server → client
-    static readonly SocketCANInterface can = new();
+    static int preProfileVelocity;
+    static int gear_ratio = 350; // tỉ số truyền cơ khí
 
-    // ================== SDO helper ==================
-    static bool WaitSdoResp(byte nodeId, ushort index, byte sub, int timeout_ms)
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public struct CanFrame
     {
-        int waited = 0;
-        while (waited < timeout_ms)
+        public uint can_id;
+        public byte can_dlc;
+        public byte __pad1, __pad2, __pad3;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public byte[] data;
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    public static extern int write(int fd, ref CanFrame frame, int len);
+
+    [DllImport("libc", SetLastError = true)]
+    public static extern int read(int fd, ref CanFrame frame, int len);
+
+    static int encoder_Resolution = 10000;
+    // Hàm gửi frame
+    public static void SendFrame(int __sock, uint canId, byte[] payload)
+    {
+        CanFrame frame = new()
         {
-            if (can.Read(out var f, 50))
+            can_id = canId,
+            can_dlc = (byte)payload.Length
+        };
+        frame.__pad1 = frame.__pad2 = frame.__pad3 = 0;
+        frame.data = new byte[8];
+        Array.Copy(payload, frame.data, payload.Length);
+        // Console.WriteLine($"");
+
+        int nbytes = write(__sock, ref frame, Marshal.SizeOf(typeof(CanFrame)));
+        if (nbytes < 0)
+            Console.WriteLine("Lỗi khi gửi frame!");
+    }
+
+
+    public static void WriteSDO_U32(int sock, uint nodeId, ushort index, byte subIndex, uint value)
+    {
+        uint sdoTxId = 0x600 + nodeId;
+        byte[] data =
+        [
+            0x23, // Write 4 bytes
+                (byte)(index & 0xFF),
+                (byte)(index >> 8),
+                subIndex,
+                (byte)(value & 0xFF),
+                (byte)((value >> 8) & 0xFF),
+                (byte)((value >> 16) & 0xFF),
+                (byte)((value >> 24) & 0xFF),
+            ];
+        SendFrame(sock, sdoTxId, data);
+        Thread.Sleep(10);
+    }
+
+    public static void WriteSDO_U8(int sock, uint nodeId, ushort index, byte subIndex, byte value)
+    {
+        uint sdoTxId = 0x600 + nodeId;
+        byte[] data = new byte[8];
+        data[0] = 0x2F; // Write 1 byte
+        data[1] = (byte)(index & 0xFF);
+        data[2] = (byte)(index >> 8);
+        data[3] = subIndex;
+        data[4] = value;
+        SendFrame(sock, sdoTxId, data);
+        Thread.Sleep(10);
+    }
+
+    public static void ConfigurePDO_Default(int sock, uint nodeId)
+    {
+        Console.WriteLine("Configuring PDO mapping...");
+
+        // ================== TPDO ==================
+        // Disable TPDO1-4
+        WriteSDO_U32(sock, nodeId, 0x1800, 1, 0x80000180 + nodeId);
+        WriteSDO_U32(sock, nodeId, 0x1801, 1, 0x80000280 + nodeId);
+        WriteSDO_U32(sock, nodeId, 0x1802, 1, 0x80000380 + nodeId);
+        WriteSDO_U32(sock, nodeId, 0x1803, 1, 0x80000480 + nodeId);
+
+        // TPDO1: Statusword(6041:00/16), ModeDisplay(6061:00/8), Error(603F:00/16)
+        WriteSDO_U8(sock, nodeId, 0x1A00, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1A00, 1, 0x60410010);
+        WriteSDO_U32(sock, nodeId, 0x1A00, 2, 0x60610008);
+        WriteSDO_U32(sock, nodeId, 0x1A00, 3, 0x603F0010);
+        WriteSDO_U8(sock, nodeId, 0x1A00, 0, 3);
+        WriteSDO_U32(sock, nodeId, 0x1800, 1, 0x00000180 + nodeId);
+
+        // TPDO2: Position(6064:00/32)
+        WriteSDO_U8(sock, nodeId, 0x1A01, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1A01, 1, 0x60640020);
+        WriteSDO_U8(sock, nodeId, 0x1A01, 0, 1);
+        WriteSDO_U32(sock, nodeId, 0x1801, 1, 0x00000280 + nodeId);
+
+        // TPDO3: Velocity(606C:00/32)
+        WriteSDO_U8(sock, nodeId, 0x1A02, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1A02, 1, 0x606C0020);
+        WriteSDO_U8(sock, nodeId, 0x1A02, 0, 1);
+        WriteSDO_U32(sock, nodeId, 0x1802, 1, 0x00000380 + nodeId);
+
+        // TPDO4: Position(6064:00/32), Velocity(606C:00/32)
+        WriteSDO_U8(sock, nodeId, 0x1A03, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1A03, 1, 0x60640020);
+        WriteSDO_U32(sock, nodeId, 0x1A03, 2, 0x606C0020);
+        WriteSDO_U8(sock, nodeId, 0x1A03, 0, 2);
+        WriteSDO_U32(sock, nodeId, 0x1803, 1, 0x00000480 + nodeId);
+
+        // ================== RPDO ==================
+        // Disable RPDO1-4
+        WriteSDO_U32(sock, nodeId, 0x1400, 1, 0x80000200 + nodeId);
+        WriteSDO_U32(sock, nodeId, 0x1401, 1, 0x80000300 + nodeId);
+        WriteSDO_U32(sock, nodeId, 0x1402, 1, 0x80000400 + nodeId);
+        WriteSDO_U32(sock, nodeId, 0x1403, 1, 0x80000500 + nodeId);
+
+        // RPDO1: Controlword(6040:00/16)
+        WriteSDO_U8(sock, nodeId, 0x1600, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1600, 1, 0x60400010);
+        WriteSDO_U8(sock, nodeId, 0x1600, 0, 1);
+        WriteSDO_U32(sock, nodeId, 0x1400, 1, 0x00000200 + nodeId);
+
+        // RPDO2: Controlword(6040:00/16), Target Position(607A:00/32)
+        WriteSDO_U8(sock, nodeId, 0x1601, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1601, 1, 0x60400010);
+        WriteSDO_U32(sock, nodeId, 0x1601, 2, 0x607A0020);
+        WriteSDO_U8(sock, nodeId, 0x1601, 0, 2);
+        WriteSDO_U32(sock, nodeId, 0x1401, 1, 0x00000300 + nodeId);
+
+        // RPDO3: Controlword(6040:00/16), Target Velocity(60FF:00/32)
+        WriteSDO_U8(sock, nodeId, 0x1602, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1602, 1, 0x60400010);
+        WriteSDO_U32(sock, nodeId, 0x1602, 2, 0x60FF0020);
+        WriteSDO_U8(sock, nodeId, 0x1602, 0, 2);
+        WriteSDO_U32(sock, nodeId, 0x1402, 1, 0x00000400 + nodeId);
+
+        // RPDO4: Physical output(60FE:01/32)
+        WriteSDO_U8(sock, nodeId, 0x1603, 0, 0);
+        WriteSDO_U32(sock, nodeId, 0x1603, 1, 0x60FE0120);
+        WriteSDO_U8(sock, nodeId, 0x1603, 0, 1);
+        WriteSDO_U32(sock, nodeId, 0x1403, 1, 0x00000500 + nodeId);
+
+        Console.WriteLine("PDO mapping configured to default.");
+    }
+    // RPDO1: Controlword
+    public static void SendControlword(int __sock, uint nodeId, ushort controlword)
+    {
+        uint rpdo1Id = 0x200 + nodeId;
+        byte[] data = new byte[8];
+        data[0] = (byte)(controlword & 0xFF);
+        data[1] = (byte)(controlword >> 8);
+        SendFrame(__sock, rpdo1Id, data);
+        Console.WriteLine($"[TPDO1] Controlword = 0x{controlword:X4}");
+    }
+
+    public static ushort ReadStatusword(int __sock, uint nodeId)
+    {
+        uint sdoTxId = 0x600 + nodeId;
+        uint sdoRxId = 0x580 + nodeId;
+        byte[] req = [0x40, 0x41, 0x60, 0x00, 0, 0, 0, 0];
+        SendFrame(__sock, sdoTxId, req);
+
+        CanFrame rxFrame = new();
+        int n = read(__sock, ref rxFrame, Marshal.SizeOf(typeof(CanFrame)));
+        if (n > 0 && rxFrame.can_id == sdoRxId)
+        {
+            return BitConverter.ToUInt16(rxFrame.data, 4);
+        }
+        return 0;
+    }
+
+    public static void SendPosition(int __sock, uint nodeId, int targetPos, int profileVelocity)
+    {
+        uint rpdo2Id = 0x300 + nodeId;   // RPDO2: Controlword + Target Position
+        uint sdoTxId = 0x600 + nodeId;   // SDO Tx
+
+        // --- nếu cần update Profile Velocity ---
+        if (profileVelocity != preProfileVelocity)
+        {
+            byte[] velData = new byte[8];
+            velData[0] = 0x23; // SDO download 4 bytes
+            velData[1] = 0x81;
+            velData[2] = 0x60;
+            velData[3] = 0x00;
+            long _profile_velocity = (((long)profileVelocity * 512 * encoder_Resolution) / 1875);
+            byte[] vbytes = BitConverter.GetBytes(_profile_velocity);
+            Array.Copy(vbytes, 0, velData, 4, 4);
+            for (int i = 0; i < 3; i++)
             {
-                if (f.can_id == SDO_SRV_BASE + nodeId &&
-                    f.data[1] == (byte)(index & 0xFF) &&
-                    f.data[2] == (byte)(index >> 8) &&
-                    f.data[3] == sub)
-                    return true;
+                SendFrame(__sock, sdoTxId, velData);
             }
-            waited += 50;
+            preProfileVelocity = profileVelocity;
+            Thread.Sleep(50);
         }
-        return false;
+
+        // --- Chuẩn bị frame RPDO2 ---
+        ushort baseCw = 0x000F; // Operation enabled
+        byte[] posBytes = BitConverter.GetBytes(targetPos);
+
+        // Lần 1: gửi controlword + pos với bit4=1, bit5=1
+        ushort cw_setpoint = (ushort)(baseCw | (1 << 4) | (1 << 5));
+        byte[] data = new byte[8];
+        data[0] = (byte)(cw_setpoint & 0xFF);
+        data[1] = (byte)(cw_setpoint >> 8);
+        Array.Copy(posBytes, 0, data, 2, 4);
+        SendFrame(__sock, rpdo2Id, data);
+
+        // Lần 2: clear bit4, giữ bit5
+        Thread.Sleep(10);
+        ushort cw_clear = (ushort)(baseCw | (1 << 5));
+        byte[] data2 = new byte[8];
+        data2[0] = (byte)(cw_clear & 0xFF);
+        data2[1] = (byte)(cw_clear >> 8);
+        Array.Copy(posBytes, 0, data2, 2, 4);
+        SendFrame(__sock, rpdo2Id, data2);
+
+        Console.WriteLine($"[RPDO2] TargetPos={targetPos}, ProfileVel={profileVelocity}");
     }
 
-    static bool SdoWrite(byte nodeId, ushort index, byte sub, uint val, byte len, int timeout_ms = 500)
+    public static void SendVelocity(int __sock, uint nodeId, int velocity, ushort controlword = 0x000F)
     {
-        can.Flush();
-        byte cs = len switch { 1 => 0x2F, 2 => 0x2B, _ => 0x23 }; // expedited transfer
-        var f = new SocketCANInterface.Can_frame
+        uint rpdo3Id = 0x400 + nodeId;   // RPDO3
+        byte[] data = new byte[6];
+
+        data[0] = (byte)(controlword & 0xFF);
+        data[1] = (byte)(controlword >> 8);
+        long _velocity = (((long)velocity * 512 * encoder_Resolution) / 1875);
+        byte[] velBytes = BitConverter.GetBytes(_velocity);
+        Array.Copy(velBytes, 0, data, 2, 4);
+
+        SendFrame(__sock, rpdo3Id, data);
+        Console.WriteLine($"[TPDO3] Velocity target = {_velocity}");
+    }
+
+    // Lắng nghe TPDO (status, velocity actual)
+    public static void ListenTPDO(int __sock, uint nodeId)
+    {
+        while (ControlSpeed._running)
         {
-            can_id = SDO_CLI_BASE + nodeId,
-            can_dlc = 8,
-            data = new byte[8]
-        };
-        f.data[0] = cs;
-        f.data[1] = (byte)(index & 0xFF);
-        f.data[2] = (byte)(index >> 8);
-        f.data[3] = sub;
-        for (int i = 0; i < len; i++) f.data[4 + i] = (byte)(val >> (8 * i));
-        can.Send(f);
-        if (!WaitSdoResp(nodeId, index, sub, timeout_ms))
-        {
-            Console.WriteLine($"⏱️ SDO timeout 0x{index:X4}");
-            return false;
+            CanFrame rx = new();
+            int nbytes = read(__sock, ref rx, Marshal.SizeOf(typeof(CanFrame)));
+            if (nbytes > 0)
+            {
+                if (rx.can_id == 0x180 + nodeId) // TPDO1
+                {
+                    ushort status = BitConverter.ToUInt16(rx.data, 0);
+                    Console.WriteLine($"[RPDO1] Statusword = 0x{status:X4}");
+                }
+                if (rx.can_id == 0x280 + nodeId)
+                {
+                    int pos = BitConverter.ToInt32(rx.data, 0);
+                    Console.WriteLine($"[RPDO2: Positon actual = {pos}");
+                }
+                if (rx.can_id == 0x380 + nodeId) // TPDO3
+                {
+                    long _vel = BitConverter.ToInt32(rx.data, 0);
+                    long vel = (_vel * 1875) / (512 * encoder_Resolution * gear_ratio);
+                    Console.WriteLine($"[RPDO3] Velocity actual = {vel}");
+                }
+                if (rx.can_id == 0x480 + nodeId)
+                {
+                    long _pos = BitConverter.ToInt32(rx.data, 0);
+                    long _vel = BitConverter.ToInt32(rx.data, 4);
+                    Console.WriteLine($"[RPDO4] Position actual = {_pos}");
+                    Console.WriteLine($"[RPDO4] Velocity actual = {_vel}");
+                }
+            }
+            Thread.Sleep(5);
         }
-        return true;
     }
 
-    static bool SdoRead(byte nodeId, ushort index, byte sub, byte[] buf)
+    public static void EnableMotorVelocityMode(int ___sock, uint _nodeId)
     {
-        can.Flush();
-        var f = new SocketCANInterface.Can_frame
-        {
-            can_id = SDO_CLI_BASE + nodeId,
-            can_dlc = 8,
-            data = new byte[8] { 0x40, (byte)(index & 0xFF), (byte)(index >> 8), sub, 0, 0, 0, 0 }
-        };
-        can.Send(f);
-        if (!WaitSdoResp(nodeId, index, sub, 500)) return false;
-        can.Read(out var resp, 50);
-        for (int i = 0; i < 4; i++) buf[i] = resp.data[4 + i];
-        return true;
-    }
-
-    static ushort ReadStatus(byte nodeId)
-    {
-        byte[] b = new byte[4];
-        if (!SdoRead(nodeId, 0x6041, 0x00, b)) return 0; // 0x6041: Statusword
-        return (ushort)(b[0] | (b[1] << 8));
-    }
-
-    static int ReadPos(byte nodeId)
-    {
-        byte[] b = new byte[4];
-        if (!SdoRead(nodeId, 0x6063, 0x00, b)) return int.MinValue; // 0x6063: Position Actual Value
-        return BitConverter.ToInt32(b, 0);
-    }
-
-    static void WriteCW(byte nodeId, ushort val)
-        => SdoWrite(nodeId, 0x6040, 0x00, val, 2); // 0x6040: Controlword
-
-    // ============= GoOperational chuẩn DS402 =============
-    static void GoOperational(byte nodeId)
-    {
-        // 1️⃣ Gửi NMT Start Node
-        var nmt = new SocketCANInterface.Can_frame { can_id = 0x000, can_dlc = 2, data = [0x01, nodeId, 0, 0, 0, 0, 0, 0] };
-        can.Send(nmt);
-        Thread.Sleep(200);
-
-        // 2️⃣ Chọn chế độ điều khiển trước (Profile Position)
-        SdoWrite(nodeId, 0x6060, 0x00, 1, 1); // 0x6060: Mode of Operation = 1 (Profile Position)
-        Thread.Sleep(100);
-
-        // 3️⃣ Chuỗi khởi động DS402
-        WriteCW(nodeId, 0x0080); // Reset Fault
-        Thread.Sleep(200);
-        WriteCW(nodeId, 0x0006); // Ready to Switch On
-        Thread.Sleep(200);
-        WriteCW(nodeId, 0x0007); // Switched On
-        Thread.Sleep(200);
-        WriteCW(nodeId, 0x000F); // Operation Enabled
-        Thread.Sleep(300);
-
-        ushort st = ReadStatus(nodeId);
-        Console.WriteLine($"Status after enable: 0x{st:X4}");
-    }
-
-    static void StopMotor(byte nodeId)
-    {
-        WriteCW(nodeId, 0x000B); // Disable Voltage
-        Thread.Sleep(100);
-        WriteCW(nodeId, 0x0000); // Shutdown
-        Console.WriteLine("\n⚠️ Motor stopped (limit exceeded).");
-    }
-
-    static bool MoveTo(byte nodeId, int target, int velDEC)
-    {
-        // 0x6081: Profile Velocity
-        if (!SdoWrite(nodeId, 0x6081, 0x00, (uint)velDEC, 4)) return false;
-
-        // 0x607A: Target Position
-        if (!SdoWrite(nodeId, 0x607A, 0x00, (uint)target, 4)) return false;
-
-        // Control sequence
-        WriteCW(nodeId, 0x001F); // New Setpoint + Change
+        uint sdoTxId = 0x600 + (uint)_nodeId;
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2F, 0x60, 0x60, 0x00, 0x03, 0x00, 0x00, 0x00]);
         Thread.Sleep(50);
-        WriteCW(nodeId, 0x000F); // Operation Enabled
-        return true;
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        Thread.Sleep(100);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00]);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
     }
 
-    static bool WaitReached(byte nodeId, int target, int tol = 500, int timeout_s = 30)
+    public static void EnableMotorPositionMode(int ___sock, uint _nodeId)
     {
-        int stable = 0;
-        for (int i = 0; i < timeout_s * 10; i++)
+        uint sdoTxId = 0x600 + (uint)_nodeId;
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2F, 0x60, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        Thread.Sleep(100);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00]);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    public static void EnableMotorHomeMode(int ___sock, uint _nodeId)
+    {
+        uint sdoTxId = 0x600 + (uint)_nodeId;
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2F, 0x60, 0x60, 0x00, 0x04, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x40, 0x61, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        Thread.Sleep(100);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x06, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00]);
+        Thread.Sleep(50);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00]);
+        ControlPDO.SendFrame(___sock, sdoTxId, [0x23, 0xFF, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    }
+}
+class Program
+{
+    const int AF_CAN = 29;
+    const int SOCK_RAW = 3;
+    const int CAN_RAW = 1;
+    const uint SIOCGIFINDEX = 0x8933;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct IfReq
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] ifr_name;
+        public int ifr_ifindex;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SockAddrCan
+    {
+        public ushort can_family;
+        public int can_ifindex;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
+        public byte[] _pad;
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int socket(int domain, int type, int protocol);
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int ioctl(int fd, uint request, ref IfReq ifr);
+
+    [DllImport("libc", SetLastError = true)]
+    static extern int bind(int fd, ref SockAddrCan addr, int addrlen);
+
+    static int sock;
+    static readonly uint nodeId = 1;
+    static readonly uint nodeId2 = 2;
+    static readonly int gear_ratio_rotate_motor = 350;
+    static readonly int convert_lift_param = 33; //lift module: 1mm/s = 33 rpm
+    static bool registerShutdowAction = true;
+
+    static void Main(string[] args)
+    {
+        StartCanOpen();
+
+        ControlPDO.SendFrame(sock, 0x000, [0x01, (byte)nodeId]);
+        ControlPDO.SendFrame(sock, 0x000, [0x01, (byte)nodeId2]);
+        Console.WriteLine("Sent NMT Start to node " + nodeId);
+
+        ControlPDO.ConfigurePDO_Default(sock, nodeId);
+        ControlPDO.ConfigurePDO_Default(sock, nodeId2);
+
+        ControlPDO.EnableMotorVelocityMode(sock, nodeId);
+        ControlPDO.EnableMotorVelocityMode(sock, nodeId2);
+
+        // ControlPDO.EnableMotorPositionMode(sock, nodeId);
+        // ControlPDO.EnableMotorPositionMode(sock, nodeId2);
+
+        ControlSpeed.Start();
+
+        if (ControlSpeed._running)
         {
-            int pos = ReadPos(nodeId);
-            if (pos == int.MinValue) continue;
-            int diff = Math.Abs(pos - target);
-            Console.Write($"\rpos={pos,8} diff={diff,6}");
-            if (diff <= tol)
-            {
-                if (++stable > 5) { Console.WriteLine("\n✅ Reached."); return true; }
-            }
-            else stable = 0;
-            Thread.Sleep(100);
+            Thread tpdoThread = new(() => ControlPDO.ListenTPDO(sock, (uint)nodeId));
+            tpdoThread.Start();
         }
-        Console.WriteLine("\n⚠️ Timeout waiting for position.");
-        return false;
-    }
-    // Giải mã bit của thanh ghi Statusword (0x6041)
-    static string DecodeStatus(ushort st)
-    {
-        List<string> s = new();
-        if ((st & (1 << 0)) != 0) s.Add("Ready");
-        if ((st & (1 << 1)) != 0) s.Add("SwitchedOn");
-        if ((st & (1 << 2)) != 0) s.Add("Enabled");
-        if ((st & (1 << 3)) != 0) s.Add("FAULT");
-        if ((st & (1 << 4)) != 0) s.Add("VoltageOn");
-        if ((st & (1 << 5)) != 0) s.Add("QuickStop");
-        if ((st & (1 << 6)) != 0) s.Add("Disabled");
-        if ((st & (1 << 7)) != 0) s.Add("Warning");
-        if ((st & (1 << 9)) != 0) s.Add("Remote");
-        if ((st & (1 << 10)) != 0) s.Add("TargetReached");
-        if ((st & (1 << 11)) != 0) s.Add("Limit");
-        if ((st & (1 << 13)) != 0) s.Add("FollowingErr");
-        if ((st & (1 << 15)) != 0) s.Add("HomeFound");
-        return string.Join(",", s);
-    }
-
-    static void Main()
-    {
-        string ifname = "can0";
-        byte nodeId = 2;
-        int posA = 0, posB = 3_700_000, vel = 5_000_000;
-
-        if (!can.Open(ifname, 50000)) return;
-        Console.WriteLine($"Connected to {ifname}");
-
-        GoOperational(nodeId);
-
-        Console.WriteLine("⬆️  UP: TOP\n⬇️  DOWN: BOTTOM\nESC: Exit");
-
-        while (true)
+        while (ControlSpeed._running)
         {
-            int pos = ReadPos(nodeId);
-            ushort st = ReadStatus(nodeId);
-            if (pos != int.MinValue)
+            if (registerShutdowAction)
             {
-                string stText = DecodeStatus(st);
-                Console.Write($"\rPos={pos,8} | {stText,-30}");
-                if (pos < posA - 5000 || pos > posB + 5000)
-                {
-                    StopMotor(nodeId);
-                    break;
-                }
+                Console.CancelKeyPress += new ConsoleCancelEventHandler(OnExit);
+                AppDomain.CurrentDomain.ProcessExit += new EventHandler(OnProcessExit);
+                registerShutdowAction = false;
             }
-
-            if (Console.KeyAvailable)
-            {
-                var k = Console.ReadKey(true).Key;
-                if (k == ConsoleKey.Escape) break;
-                if (k == ConsoleKey.UpArrow)
-                {
-                    if (pos > posB - 10000)
-                    {
-                        Console.WriteLine("\n⚠️ Near top limit!");
-                        continue;
-                    }
-                    Console.WriteLine($"\n>>> Move to TOP ({posB})");
-                    if (MoveTo(nodeId, posB, vel)) WaitReached(nodeId, posB);
-                }
-                else if (k == ConsoleKey.DownArrow)
-                {
-                    if (pos < posA + 10000)
-                    {
-                        Console.WriteLine("\n⚠️ Near bottom limit!");
-                        continue;
-                    }
-                    Console.WriteLine($"\n<<< Move to BOTTOM ({posA})");
-                    if (MoveTo(nodeId, posA, vel)) WaitReached(nodeId, posA);
-                }
-            }
-            Thread.Sleep(100);
+            int speed_rotation = ControlSpeed.GetSpeed() * gear_ratio_rotate_motor;
+            int speed_lift = Convert.ToInt32(ControlSpeed.GetSpeed() * convert_lift_param);
+            ControlPDO.SendVelocity(sock, (uint)nodeId, speed_rotation);
+            ControlPDO.SendVelocity(sock, (uint)nodeId2, speed_lift);
+            // ControlPDO.SendPosition(sock, nodeId, 90000000, speed_rotation);
+            // ControlPDO.SendPosition(sock, nodeId2, 90000000, speed_lift);
+            Thread.Sleep(1000);
         }
 
-        can.Close();
-        Console.WriteLine("\nSocket closed.");
+    }
+
+    static void StartCanOpen()
+    {
+        // 1. Tạo socket CAN
+        sock = socket(AF_CAN, SOCK_RAW, CAN_RAW);
+        if (sock < 0)
+        {
+            Console.WriteLine("Không tạo được socket CAN!");
+            return;
+        }
+        // 2. Lấy ifindex từ can0
+        IfReq ifr = new()
+        {
+            ifr_name = Encoding.ASCII.GetBytes("can0\0".PadRight(16, '\0')),
+            ifr_ifindex = 0
+        };
+        if (ioctl(sock, SIOCGIFINDEX, ref ifr) < 0)
+        {
+            Console.WriteLine("Không lấy được ifindex của can0!");
+            return;
+        }
+
+        // 3. Bind socket tới can0
+        SockAddrCan addr = new()
+        {
+            can_family = AF_CAN,
+            can_ifindex = ifr.ifr_ifindex,
+            _pad = new byte[8]
+        };
+        if (bind(sock, ref addr, Marshal.SizeOf(typeof(SockAddrCan))) < 0)
+        {
+            Console.WriteLine("Không bind được socket tới can0!");
+            return;
+        }
+
+        Console.WriteLine($"SocketCAN opened & bound to can0 (fd={sock})");
+    }
+
+    static void OnExit(object? sender, ConsoleCancelEventArgs args)
+    {
+        Console.WriteLine("Nhận Ctrl+C, gửi Velocity = 0...");
+        ControlSpeed._running = false;
+        ControlPDO.SendVelocity(sock, nodeId, 0);
+        Thread.Sleep(200); // đảm bảo gửi đi
+    }
+
+    static void OnProcessExit(object? sender, EventArgs e)
+    {
+        Console.WriteLine("ProcessExit, gửi Velocity = 0...");
+        ControlSpeed._running = false;
+        ControlPDO.SendVelocity(sock, nodeId, 0);
+        Thread.Sleep(200);
     }
 }
